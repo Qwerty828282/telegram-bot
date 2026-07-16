@@ -1181,7 +1181,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SELECT ta.user_id, u.username, u.full_name, COUNT(ta.id) as cnt "
             "FROM tutorial_access ta "
             "LEFT JOIN users u ON u.user_id = ta.user_id "
-            "GROUP BY ta.user_id "
+            "GROUP BY ta.user_id, u.username, u.full_name "
             "ORDER BY cnt DESC LIMIT 20"
         ).fetchall()
         conn.close()
