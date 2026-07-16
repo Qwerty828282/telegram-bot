@@ -43,14 +43,9 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 USE_PG = bool(DATABASE_URL)
 
-# Если запущен на Railway без PostgreSQL — ругаемся сразу
 ON_RAILWAY = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
 if ON_RAILWAY and not USE_PG:
-    raise RuntimeError(
-        "❌ DATABASE_URL не задан!\n"
-        "Добавьте PostgreSQL в Railway: New → Database → PostgreSQL\n"
-        "DATABASE_URL подставится автоматически."
-    )
+    logger.warning("⚠️  DATABASE_URL не задан — используется SQLite. Данные сбросятся при перезапуске!")
 
 if not USE_PG:
     # SQLite — только локально
