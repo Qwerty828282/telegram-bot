@@ -474,24 +474,18 @@ def generate_key() -> str:
     return "-".join("".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(4))
 
 
-def register_user(user):
+def register_and_promote(user):
+    """Register user and auto-promote if pending — single DB connection for speed."""
     conn = get_db()
     _db_insert_ignore_user(conn, user.id, user.username, user.full_name, datetime.now().isoformat())
+    if user.username:
+        row = conn.execute(
+            "SELECT * FROM pending_admins WHERE username = ?", (user.username.lower(),)
+        ).fetchone()
+        if row:
+            _db_insert_ignore_admin(conn, user.id, user.username, datetime.now().isoformat())
+            conn.execute("DELETE FROM pending_admins WHERE username = ?", (user.username.lower(),))
     conn.commit()
-    conn.close()
-
-
-def check_and_promote(user_id: int, username: str | None):
-    if not username:
-        return
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM pending_admins WHERE username = ?", (username.lower(),)
-    ).fetchone()
-    if row:
-        _db_insert_ignore_admin(conn, user_id, username, datetime.now().isoformat())
-        conn.execute("DELETE FROM pending_admins WHERE username = ?", (username.lower(),))
-        conn.commit()
     conn.close()
 
 
@@ -526,11 +520,8 @@ def admin_inline_kb(user_id: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 Статистика",                   callback_data="admin_stats")],
         [InlineKeyboardButton("🔑 Создать ключ для туториалов",  callback_data="admin_create_key")],
         [InlineKeyboardButton("📋 Все ключи туториалов",         callback_data="admin_keys_list")],
-        [InlineKeyboardButton("🔑 Создать ключ для сборок",      callback_data="admin_create_build_key")],
-        [InlineKeyboardButton("📋 Все ключи сборок",             callback_data="admin_build_keys_list")],
         [InlineKeyboardButton("💬 Обращения в поддержку",        callback_data="admin_support_list")],
-        [InlineKeyboardButton("🔄 Обнулить подписку (туториал)", callback_data="admin_reset_sub_list")],
-        [InlineKeyboardButton("🔄 Обнулить подписку (сборки)",   callback_data="admin_reset_build_sub_list")],
+        [InlineKeyboardButton("🔄 Обнулить доступ (туториал)",   callback_data="admin_reset_sub_list")],
     ]
     if user_id == OWNER_ID:
         rows.append([InlineKeyboardButton("👤 Выдать права админа",  callback_data="admin_grant")])
@@ -547,8 +538,7 @@ def back_admin_kb() -> InlineKeyboardMarkup:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     context.user_data.clear()
-    register_user(user)
-    check_and_promote(user.id, user.username)
+    register_and_promote(user)
 
     await update.message.reply_text(
         f"👋 Здравствуйте, {user.first_name}!\n\n"
@@ -753,7 +743,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data
     user = q.from_user
-    check_and_promote(user.id, user.username)
+    register_and_promote(user)
 
     if data == "admin_panel":
         if not is_admin(user.id):
@@ -1409,13 +1399,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("view_build_"):
         build_id = int(data.split("_")[2])
         conn = get_db()
-        access = conn.execute(
-            "SELECT id FROM build_access WHERE user_id = ? LIMIT 1", (user.id,)
-        ).fetchone()
-        if not access and user.id != OWNER_ID and not is_admin(user.id):
-            conn.close()
-            await q.answer("🔑 Для просмотра сборки нужен ключ доступа.", show_alert=True)
-            return
         row = conn.execute("SELECT * FROM builds WHERE id = ?", (build_id,)).fetchone()
         conn.close()
         if not row:
@@ -1484,8 +1467,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg  = update.message
     user = update.effective_user
     text = msg.text or ""
-    register_user(user)
-    check_and_promote(user.id, user.username)
+    register_and_promote(user)
 
     state = context.user_data.get("state")
 
@@ -1494,67 +1476,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == BTN_BUILDS:
         conn = get_db()
         rows = conn.execute("SELECT id, title, text FROM builds ORDER BY id DESC LIMIT 30").fetchall()
-        has_build_access = conn.execute(
-            "SELECT id FROM build_access WHERE user_id = ? LIMIT 1", (user.id,)
-        ).fetchone()
         conn.close()
         if not rows:
             await msg.reply_text("📦 Сборок пока нет.")
             return
-        buttons = []
-        for r in rows:
-            label = (r["title"] or r["text"] or f"Сборка #{r['id']}")[:40]
-            buttons.append([InlineKeyboardButton(label, callback_data=f"view_build_{r['id']}")])
-        if not has_build_access and not is_admin(user.id):
-            await msg.reply_text(
-                "📦 *Сборки*\n\n"
-                "🔑 Для доступа к сборкам нужен ключ.\n"
-                "Введите ключ командой: `/key XXXX-XXXX-XXXX-XXXX`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
-        else:
-            await msg.reply_text(
-                "📦 *Все сборки:*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
+        buttons = [[InlineKeyboardButton(
+            (r["title"] or r["text"] or f"Сборка #{r['id']}")[:40],
+            callback_data=f"view_build_{r['id']}"
+        )] for r in rows]
+        await msg.reply_text("📦 *Все сборки:*", parse_mode="Markdown",
+                             reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if text == BTN_TUTORIALS:
         conn = get_db()
+        has_access = conn.execute(
+            "SELECT id FROM tutorial_access WHERE user_id = ? LIMIT 1", (user.id,)
+        ).fetchone()
+        admin = is_admin(user.id)
+        if not has_access and not admin:
+            conn.close()
+            await msg.reply_text(
+                "📚 *Туториалы на сборки*\n\n"
+                "🔑 Для доступа нужен ключ.\n\n"
+                "Введите его командой:\n`/key XXXX-XXXX-XXXX-XXXX`",
+                parse_mode="Markdown",
+            )
+            return
         rows = conn.execute("SELECT id, title, text FROM tutorials ORDER BY id DESC LIMIT 30").fetchall()
         conn.close()
         if not rows:
             await msg.reply_text("📚 Туториалов пока нет.")
             return
-        # Check if user has access
-        user_access = conn.execute if False else None  # re-open below
-        conn2 = get_db()
-        has_access = conn2.execute(
-            "SELECT id FROM tutorial_access WHERE user_id = ? LIMIT 1", (user.id,)
-        ).fetchone()
-        conn2.close()
-
-        buttons = []
-        for r in rows:
-            label = (r["title"] or r["text"] or f"Туториал #{r['id']}")[:40]
-            buttons.append([InlineKeyboardButton(label, callback_data=f"view_tutorial_{r['id']}")])
-
-        if not has_access and not is_admin(user.id):
-            await msg.reply_text(
-                "📚 *Туториалы на сборки*\n\n"
-                "🔑 Для доступа к туториалам нужен ключ.\n"
-                "Введите ключ командой: /key XXXX-XXXX-XXXX-XXXX",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
-        else:
-            await msg.reply_text(
-                "📚 *Туториалы на сборки:*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
+        buttons = [[InlineKeyboardButton(
+            (r["title"] or r["text"] or f"Туториал #{r['id']}")[:40],
+            callback_data=f"view_tutorial_{r['id']}"
+        )] for r in rows]
+        await msg.reply_text("📚 *Туториалы на сборки:*", parse_mode="Markdown",
+                             reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if text == BTN_SUPPORT:
@@ -1755,82 +1714,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    register_user(user)
+    register_and_promote(user)
     args = context.args or []
     if not args:
         await update.message.reply_text(
             "🔑 *Активация ключа*\n\n"
-            "Использование: `/key XXXX-XXXX-XXXX-XXXX`\n\n"
-            "Ключ даёт доступ к разделу *Сборки* или *Туториалы* — в зависимости от типа ключа.",
+            "Использование: `/key XXXX-XXXX-XXXX-XXXX`",
             parse_mode="Markdown",
         )
         return
     key_value = args[0].strip().upper()
     conn = get_db()
-
-    # Проверяем ключ туториалов
-    tut_row = conn.execute(
+    row = conn.execute(
         "SELECT * FROM tutorial_keys WHERE key_value = ?", (key_value,)
     ).fetchone()
-
-    # Проверяем ключ сборок
-    build_row = conn.execute(
-        "SELECT * FROM build_keys WHERE key_value = ?", (key_value,)
-    ).fetchone()
-
-    if not tut_row and not build_row:
+    if not row:
         conn.close()
         await update.message.reply_text("❌ Ключ не найден. Проверьте правильность ввода.")
         return
-
-    now = datetime.now().isoformat()
-
-    if tut_row:
-        if tut_row["used_by"] is not None:
-            conn.close()
-            if tut_row["used_by"] == user.id:
-                await update.message.reply_text("ℹ️ Этот ключ туториалов уже привязан к вашему аккаунту.")
-            else:
-                await update.message.reply_text("❌ Этот ключ уже использован другим пользователем.")
-            return
-        conn.execute(
-            "UPDATE tutorial_keys SET used_by = ?, used_at = ? WHERE key_value = ?",
-            (user.id, now, key_value),
-        )
-        _db_upsert_tutorial_access(conn, user.id, key_value, now)
-        conn.commit()
+    if row["used_by"] is not None:
         conn.close()
-        await update.message.reply_text(
-            "✅ *Ключ активирован!*\n\n"
-            "Теперь у вас есть доступ к *туториалам*.\n"
-            "Нажмите «📚 Туторы на сборки» в меню.",
-            parse_mode="Markdown",
-            reply_markup=main_kb(user.id),
-        )
+        if row["used_by"] == user.id:
+            await update.message.reply_text("ℹ️ Этот ключ уже привязан к вашему аккаунту.")
+        else:
+            await update.message.reply_text("❌ Этот ключ уже использован другим пользователем.")
         return
-
-    if build_row:
-        if build_row["used_by"] is not None:
-            conn.close()
-            if build_row["used_by"] == user.id:
-                await update.message.reply_text("ℹ️ Этот ключ сборок уже привязан к вашему аккаунту.")
-            else:
-                await update.message.reply_text("❌ Этот ключ уже использован другим пользователем.")
-            return
-        conn.execute(
-            "UPDATE build_keys SET used_by = ?, used_at = ? WHERE key_value = ?",
-            (user.id, now, key_value),
-        )
-        _db_upsert_build_access(conn, user.id, key_value, now)
-        conn.commit()
-        conn.close()
-        await update.message.reply_text(
-            "✅ *Ключ активирован!*\n\n"
-            "Теперь у вас есть доступ к *сборкам*.\n"
-            "Нажмите «📦 Все сборки» в меню.",
-            parse_mode="Markdown",
-            reply_markup=main_kb(user.id),
-        )
+    now = datetime.now().isoformat()
+    conn.execute(
+        "UPDATE tutorial_keys SET used_by = ?, used_at = ? WHERE key_value = ?",
+        (user.id, now, key_value),
+    )
+    _db_upsert_tutorial_access(conn, user.id, key_value, now)
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        "✅ *Ключ активирован!*\n\n"
+        "Теперь у вас есть доступ к туториалам.\n"
+        "Нажмите «📚 Туторы на сборки» в меню.",
+        parse_mode="Markdown",
+        reply_markup=main_kb(user.id),
+    )
 
 
 # ─────────────────────────── main ───────────────────────────
