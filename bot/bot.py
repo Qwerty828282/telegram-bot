@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID  = int(os.environ["OWNER_ID"])
 
+# In-memory cache: users already registered this process run — skip repeated DB writes
+_registered_ids: set = set()
+
 # ─────────────────────────── Database backend ───────────────────────────
 # На Railway ОБЯЗАТЕЛЬНО нужен PostgreSQL (данные не стираются при деплое).
 # SQLite используется только для локальной разработки.
@@ -475,7 +478,12 @@ def generate_key() -> str:
 
 
 def register_and_promote(user):
-    """Register user and auto-promote if pending — single DB connection for speed."""
+    """Register user and auto-promote if pending.
+    Uses in-memory cache: skip DB entirely if user was already seen this run.
+    Promotion check still runs once per restart (cheap — only fires when in pending_admins).
+    """
+    if user.id in _registered_ids:
+        return
     conn = get_db()
     _db_insert_ignore_user(conn, user.id, user.username, user.full_name, datetime.now().isoformat())
     if user.username:
@@ -487,6 +495,7 @@ def register_and_promote(user):
             conn.execute("DELETE FROM pending_admins WHERE username = ?", (user.username.lower(),))
     conn.commit()
     conn.close()
+    _registered_ids.add(user.id)
 
 
 def _extract_media(msg):
@@ -1496,10 +1505,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admin = is_admin(user.id)
         if not has_access and not admin:
             conn.close()
+            context.user_data["state"] = "awaiting_key"
             await msg.reply_text(
                 "📚 *Туториалы на сборки*\n\n"
                 "🔑 Для доступа нужен ключ.\n\n"
-                "Введите его командой:\n`/key XXXX-XXXX-XXXX-XXXX`",
+                "Введите ваш ключ:",
                 parse_mode="Markdown",
             )
             return
@@ -1539,6 +1549,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── State machine ──
+
+    if state == "awaiting_key":
+        key_value = text.strip().upper()
+        context.user_data["state"] = None
+        conn = get_db()
+        # 1 пользователь — 1 ключ: проверяем, нет ли уже доступа
+        already = conn.execute(
+            "SELECT id FROM tutorial_access WHERE user_id = ? LIMIT 1", (user.id,)
+        ).fetchone()
+        if already:
+            conn.close()
+            await msg.reply_text(
+                "ℹ️ У вас уже активирован ключ — доступ к туториалам открыт.",
+                reply_markup=main_kb(user.id),
+            )
+            return
+        row = conn.execute(
+            "SELECT * FROM tutorial_keys WHERE key_value = ?", (key_value,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            await msg.reply_text(
+                "❌ Ключ не найден. Проверьте правильность ввода и попробуйте ещё раз.\n\n"
+                "Введите ваш ключ:",
+            )
+            context.user_data["state"] = "awaiting_key"
+            return
+        if row["used_by"] is not None:
+            conn.close()
+            if row["used_by"] == user.id:
+                await msg.reply_text(
+                    "ℹ️ Этот ключ уже привязан к вашему аккаунту.",
+                    reply_markup=main_kb(user.id),
+                )
+            else:
+                await msg.reply_text(
+                    "❌ Этот ключ уже использован другим пользователем.\n\n"
+                    "Введите другой ключ:",
+                )
+                context.user_data["state"] = "awaiting_key"
+            return
+        now = datetime.now().isoformat()
+        conn.execute(
+            "UPDATE tutorial_keys SET used_by = ?, used_at = ? WHERE key_value = ?",
+            (user.id, now, key_value),
+        )
+        _db_upsert_tutorial_access(conn, user.id, key_value, now)
+        conn.commit()
+        conn.close()
+        await msg.reply_text(
+            "✅ *Ключ активирован!*\n\n"
+            "Доступ к туториалам открыт. Нажмите «📚 Туторы на сборки» в меню.",
+            parse_mode="Markdown",
+            reply_markup=main_kb(user.id),
+        )
+        return
 
     if state == "support_waiting":
         # Cooldown check
@@ -1713,47 +1779,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────── /key command ───────────────────────────
 
 async def cmd_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias: /key — просто запускает диалоговый ввод ключа."""
     user = update.effective_user
     register_and_promote(user)
-    args = context.args or []
-    if not args:
+    conn = get_db()
+    already = conn.execute(
+        "SELECT id FROM tutorial_access WHERE user_id = ? LIMIT 1", (user.id,)
+    ).fetchone()
+    conn.close()
+    if already:
         await update.message.reply_text(
-            "🔑 *Активация ключа*\n\n"
-            "Использование: `/key XXXX-XXXX-XXXX-XXXX`",
-            parse_mode="Markdown",
+            "ℹ️ У вас уже активирован ключ — доступ к туториалам открыт.",
+            reply_markup=main_kb(user.id),
         )
         return
-    key_value = args[0].strip().upper()
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM tutorial_keys WHERE key_value = ?", (key_value,)
-    ).fetchone()
-    if not row:
-        conn.close()
-        await update.message.reply_text("❌ Ключ не найден. Проверьте правильность ввода.")
-        return
-    if row["used_by"] is not None:
-        conn.close()
-        if row["used_by"] == user.id:
-            await update.message.reply_text("ℹ️ Этот ключ уже привязан к вашему аккаунту.")
-        else:
-            await update.message.reply_text("❌ Этот ключ уже использован другим пользователем.")
-        return
-    now = datetime.now().isoformat()
-    conn.execute(
-        "UPDATE tutorial_keys SET used_by = ?, used_at = ? WHERE key_value = ?",
-        (user.id, now, key_value),
-    )
-    _db_upsert_tutorial_access(conn, user.id, key_value, now)
-    conn.commit()
-    conn.close()
-    await update.message.reply_text(
-        "✅ *Ключ активирован!*\n\n"
-        "Теперь у вас есть доступ к туториалам.\n"
-        "Нажмите «📚 Туторы на сборки» в меню.",
-        parse_mode="Markdown",
-        reply_markup=main_kb(user.id),
-    )
+    context.user_data["state"] = "awaiting_key"
+    await update.message.reply_text("🔑 Введите ваш ключ:")
 
 
 # ─────────────────────────── main ───────────────────────────
