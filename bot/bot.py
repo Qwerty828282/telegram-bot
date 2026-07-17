@@ -36,6 +36,8 @@ OWNER_ID  = int(os.environ["OWNER_ID"])
 
 # In-memory cache: users already registered this process run — skip repeated DB writes
 _registered_ids: set = set()
+# In-memory ban cache — loaded from DB at startup, updated on ban/unban
+_banned_ids: set = set()
 
 # ─────────────────────────── Database backend ───────────────────────────
 # На Railway ОБЯЗАТЕЛЬНО нужен PostgreSQL (данные не стираются при деплое).
@@ -190,6 +192,12 @@ def init_db():
                 user_id   BIGINT PRIMARY KEY,
                 last_sent TEXT
             )""",
+            """CREATE TABLE IF NOT EXISTS banned_users (
+                user_id   BIGINT PRIMARY KEY,
+                username  TEXT,
+                banned_at TEXT,
+                reason    TEXT
+            )""",
         ]
         for stmt in stmts:
             conn._cur.execute(stmt)
@@ -319,6 +327,12 @@ def init_db():
                 user_id   INTEGER PRIMARY KEY,
                 last_sent TEXT
             );
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id   INTEGER PRIMARY KEY,
+                username  TEXT,
+                banned_at TEXT,
+                reason    TEXT
+            );
         """)
         for sql in [
             "ALTER TABLE builds    ADD COLUMN title       TEXT",
@@ -334,8 +348,12 @@ def init_db():
                 pass
 
     conn.commit()
+    # Загружаем список забаненных в кэш при старте
+    rows = conn.execute("SELECT user_id FROM banned_users").fetchall()
+    _banned_ids.update(r["user_id"] for r in rows)
     conn.close()
-    logger.info("DB initialised (backend: %s)", "PostgreSQL" if USE_PG else "SQLite")
+    logger.info("DB initialised (backend: %s), banned cache: %d ids",
+                "PostgreSQL" if USE_PG else "SQLite", len(_banned_ids))
 
 
 # ─────────────────────────── DB upsert helpers ───────────────────────────
@@ -535,6 +553,8 @@ def admin_inline_kb(user_id: int = 0) -> InlineKeyboardMarkup:
     if user_id == OWNER_ID:
         rows.append([InlineKeyboardButton("👤 Выдать права админа",  callback_data="admin_grant")])
         rows.append([InlineKeyboardButton("🚫 Забрать права админа", callback_data="admin_revoke_list")])
+        rows.append([InlineKeyboardButton("🔨 Забанить пользователя",  callback_data="owner_ban")])
+        rows.append([InlineKeyboardButton("✅ Список банов / разбан",  callback_data="owner_ban_list")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -753,6 +773,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
     user = q.from_user
     register_and_promote(user)
+
+    if user.id in _banned_ids and user.id != OWNER_ID:
+        await q.answer("🚫 Вы заблокированы.", show_alert=True)
+        return
 
     if data == "admin_panel":
         if not is_admin(user.id):
@@ -1217,6 +1241,105 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await q.edit_message_text("✅ Права администратора отозваны.", reply_markup=back_admin_kb())
 
+    elif data == "owner_ban":
+        if user.id != OWNER_ID:
+            return
+        context.user_data["state"] = "owner_ban_input"
+        await q.edit_message_text(
+            "🔨 *Бан пользователя*\n\n"
+            "Введите *username* (без @) или *числовой ID* пользователя:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_panel")]]),
+        )
+
+    elif data == "owner_ban_list":
+        if user.id != OWNER_ID:
+            return
+        conn = get_db()
+        bans = conn.execute(
+            "SELECT user_id, username, banned_at FROM banned_users ORDER BY banned_at DESC"
+        ).fetchall()
+        conn.close()
+        if not bans:
+            await q.edit_message_text(
+                "✅ *Список банов*\n\nЗабаненных пользователей нет.",
+                parse_mode="Markdown",
+                reply_markup=back_admin_kb(),
+            )
+            return
+        buttons = []
+        for r in bans:
+            label = f"@{r['username']}" if r["username"] else str(r["user_id"])
+            date  = (r["banned_at"] or "")[:10]
+            buttons.append([InlineKeyboardButton(
+                f"✅ Разбанить {label} ({date})",
+                callback_data=f"owner_unban_{r['user_id']}",
+            )])
+        buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")])
+        await q.edit_message_text(
+            f"🔨 *Забаненные пользователи* ({len(bans)}):\n\nНажмите чтобы разбанить:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("confirm_ban_"):
+        if user.id != OWNER_ID:
+            return
+        target_id = int(data.split("_")[2])
+        if target_id == OWNER_ID:
+            await q.edit_message_text("❌ Нельзя забанить создателя.", reply_markup=back_admin_kb())
+            return
+        conn = get_db()
+        target = conn.execute("SELECT username, full_name FROM users WHERE user_id = ?", (target_id,)).fetchone()
+        uname  = target["username"] if target and target["username"] else None
+        now    = datetime.now().isoformat()
+        if USE_PG:
+            conn._cur.execute(
+                "INSERT INTO banned_users (user_id, username, banned_at) VALUES (%s, %s, %s) "
+                "ON CONFLICT (user_id) DO UPDATE SET banned_at = EXCLUDED.banned_at",
+                (target_id, uname, now),
+            )
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO banned_users (user_id, username, banned_at) VALUES (?, ?, ?)",
+                (target_id, uname, now),
+            )
+        # Убираем из кэша регистрации — следующее сообщение от него опять упрётся в бан
+        _registered_ids.discard(target_id)
+        conn.commit()
+        conn.close()
+        _banned_ids.add(target_id)
+        context.user_data.clear()
+        label = f"@{uname}" if uname else str(target_id)
+        try:
+            await context.bot.send_message(target_id, "🚫 Вы заблокированы создателем бота.")
+        except Exception:
+            pass
+        await q.edit_message_text(
+            f"🔨 Пользователь {label} заблокирован.",
+            reply_markup=back_admin_kb(),
+        )
+
+    elif data.startswith("owner_unban_"):
+        if user.id != OWNER_ID:
+            return
+        target_id = int(data.split("_")[2])
+        conn = get_db()
+        target = conn.execute("SELECT username FROM banned_users WHERE user_id = ?", (target_id,)).fetchone()
+        conn.execute("DELETE FROM banned_users WHERE user_id = ?", (target_id,))
+        conn.commit()
+        conn.close()
+        _banned_ids.discard(target_id)
+        label = f"@{target['username']}" if target and target["username"] else str(target_id)
+        try:
+            await context.bot.send_message(target_id, "✅ Вы разблокированы. Напишите /start.")
+        except Exception:
+            pass
+        await q.edit_message_text(
+            f"✅ Пользователь {label} разблокирован.",
+            reply_markup=back_admin_kb(),
+        )
+
     elif data == "admin_reset_sub_list":
         if not is_admin(user.id):
             return
@@ -1478,6 +1601,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = msg.text or ""
     register_and_promote(user)
 
+    if user.id in _banned_ids and user.id != OWNER_ID:
+        await msg.reply_text("🚫 Вы заблокированы и не можете использовать бота.")
+        return
+
     state = context.user_data.get("state")
 
     # ── Main menu buttons ──
@@ -1549,6 +1676,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── State machine ──
+
+    if state == "owner_ban_input":
+        if user.id != OWNER_ID:
+            return
+        context.user_data["state"] = None
+        raw = text.strip().lstrip("@")
+        conn = get_db()
+        # Ищем по username или по числовому ID
+        if raw.isdigit():
+            target = conn.execute("SELECT user_id, username FROM users WHERE user_id = ?", (int(raw),)).fetchone()
+            target_id = int(raw) if not target else target["user_id"]
+            uname = target["username"] if target else None
+        else:
+            target = conn.execute(
+                "SELECT user_id, username FROM users WHERE LOWER(username) = ?", (raw.lower(),)
+            ).fetchone()
+            target_id = target["user_id"] if target else None
+            uname     = raw if not target else target["username"]
+        conn.close()
+        if not target_id:
+            await msg.reply_text(
+                f"❌ Пользователь @{raw} не найден в базе.\n\n"
+                "Он должен хотя бы раз написать боту. Введите другой username или ID:",
+            )
+            context.user_data["state"] = "owner_ban_input"
+            return
+        if target_id == OWNER_ID:
+            await msg.reply_text("❌ Нельзя забанить создателя.")
+            return
+        label = f"@{uname}" if uname else str(target_id)
+        await msg.reply_text(
+            f"🔨 Забанить {label} (ID: {target_id})?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Да, забанить",  callback_data=f"confirm_ban_{target_id}")],
+                [InlineKeyboardButton("❌ Отмена",        callback_data="admin_panel")],
+            ]),
+        )
+        return
 
     if state == "awaiting_key":
         key_value = text.strip().upper()
