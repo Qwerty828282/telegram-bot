@@ -620,27 +620,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     register_and_promote(user)
 
-    # Проверка подписки на канал — только если ещё не подтверждена
-    if user.id not in _channel_verified:
-        subscribed = await _verify_subscription(context.bot, user.id)
-        if subscribed:
-            await _mark_verified(user.id)
-        else:
-            await update.message.reply_text(
-                f"👋 Привет, {user.first_name}!\n\n"
-                f"Для использования бота нужно подписаться на наш канал:\n"
-                f"{CHANNEL_LINK}\n\n"
-                "После подписки нажмите кнопку ниже 👇",
-                reply_markup=_sub_keyboard(),
-            )
-            return
+    # Если уже подтверждён (нажал «Я подписался» раньше) — сразу в меню
+    if user.id in _channel_verified:
+        await update.message.reply_text(
+            f"👋 Здравствуйте, {user.first_name}!\n\n"
+            "Вы попали в нашего Telegram-бота.\n"
+            "Здесь вы можете найти многое о сборках.\n\n"
+            "Выберите раздел:",
+            reply_markup=main_kb(user.id),
+        )
+        return
 
+    # Новый / непроверенный пользователь — всегда показываем капчу
     await update.message.reply_text(
-        f"👋 Здравствуйте, {user.first_name}!\n\n"
-        "Вы попали в нашего Telegram-бота.\n"
-        "Здесь вы можете найти многое о сборках.\n\n"
-        "Выберите раздел:",
-        reply_markup=main_kb(user.id),
+        f"👋 Привет, {user.first_name}!\n\n"
+        f"Для использования бота необходимо подписаться на наш канал:\n"
+        f"{CHANNEL_LINK}\n\n"
+        "После подписки нажмите кнопку ниже 👇",
+        reply_markup=_sub_keyboard(),
     )
 
 
