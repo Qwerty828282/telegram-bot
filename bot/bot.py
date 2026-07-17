@@ -32,13 +32,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID  = int(os.environ["OWNER_ID"])
+BOT_TOKEN        = os.environ["BOT_TOKEN"]
+OWNER_ID         = int(os.environ["OWNER_ID"])
+CHANNEL_USERNAME = "@neworss"          # канал для обязательной подписки
+CHANNEL_LINK     = "https://t.me/neworss"
 
 # In-memory cache: users already registered this process run — skip repeated DB writes
 _registered_ids: set = set()
 # In-memory ban cache — loaded from DB at startup, updated on ban/unban
 _banned_ids: set = set()
+# In-memory cache подтверждённых подписчиков — никогда больше не спрашиваем
+_channel_verified: set = set()
 
 # ─────────────────────────── Database backend ───────────────────────────
 # На Railway ОБЯЗАТЕЛЬНО нужен PostgreSQL (данные не стираются при деплое).
@@ -199,6 +203,10 @@ def init_db():
                 banned_at TEXT,
                 reason    TEXT
             )""",
+            """CREATE TABLE IF NOT EXISTS channel_subs (
+                user_id     BIGINT PRIMARY KEY,
+                verified_at TEXT
+            )""",
         ]
         for stmt in stmts:
             conn._cur.execute(stmt)
@@ -334,6 +342,10 @@ def init_db():
                 banned_at TEXT,
                 reason    TEXT
             );
+            CREATE TABLE IF NOT EXISTS channel_subs (
+                user_id     INTEGER PRIMARY KEY,
+                verified_at TEXT
+            );
         """)
         for sql in [
             "ALTER TABLE builds    ADD COLUMN title       TEXT",
@@ -349,12 +361,14 @@ def init_db():
                 pass
 
     conn.commit()
-    # Загружаем список забаненных в кэш при старте
+    # Загружаем кэши при старте
     rows = conn.execute("SELECT user_id FROM banned_users").fetchall()
     _banned_ids.update(r["user_id"] for r in rows)
+    rows = conn.execute("SELECT user_id FROM channel_subs").fetchall()
+    _channel_verified.update(r["user_id"] for r in rows)
     conn.close()
-    logger.info("DB initialised (backend: %s), banned cache: %d ids",
-                "PostgreSQL" if USE_PG else "SQLite", len(_banned_ids))
+    logger.info("DB initialised (backend: %s), banned: %d, channel_verified: %d",
+                "PostgreSQL" if USE_PG else "SQLite", len(_banned_ids), len(_channel_verified))
 
 
 # ─────────────────────────── DB upsert helpers ───────────────────────────
@@ -566,10 +580,60 @@ def back_admin_kb() -> InlineKeyboardMarkup:
 
 # ─────────────────────────── /start ───────────────────────────
 
+def _sub_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Подписаться на канал", url=CHANNEL_LINK)],
+        [InlineKeyboardButton("✅ Я подписался",         callback_data="check_sub")],
+    ])
+
+
+async def _verify_subscription(bot, user_id: int) -> bool:
+    """Проверяет подписку через API. True = подписан."""
+    try:
+        member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+
+async def _mark_verified(user_id: int):
+    """Сохраняет подписку в БД и кэш."""
+    _channel_verified.add(user_id)
+    conn = get_db()
+    if USE_PG:
+        conn._cur.execute(
+            "INSERT INTO channel_subs (user_id, verified_at) VALUES (%s, %s) "
+            "ON CONFLICT (user_id) DO NOTHING",
+            (user_id, datetime.now().isoformat()),
+        )
+    else:
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_subs (user_id, verified_at) VALUES (?, ?)",
+            (user_id, datetime.now().isoformat()),
+        )
+    conn.commit()
+    conn.close()
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     context.user_data.clear()
     register_and_promote(user)
+
+    # Проверка подписки на канал — только если ещё не подтверждена
+    if user.id not in _channel_verified:
+        subscribed = await _verify_subscription(context.bot, user.id)
+        if subscribed:
+            await _mark_verified(user.id)
+        else:
+            await update.message.reply_text(
+                f"👋 Привет, {user.first_name}!\n\n"
+                f"Для использования бота нужно подписаться на наш канал:\n"
+                f"{CHANNEL_LINK}\n\n"
+                "После подписки нажмите кнопку ниже 👇",
+                reply_markup=_sub_keyboard(),
+            )
+            return
 
     await update.message.reply_text(
         f"👋 Здравствуйте, {user.first_name}!\n\n"
@@ -778,6 +842,28 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user.id in _banned_ids and user.id != OWNER_ID:
         await q.answer("🚫 Вы заблокированы.", show_alert=True)
+        return
+
+    if data == "check_sub":
+        if user.id in _channel_verified:
+            await q.edit_message_text(
+                f"👋 Здравствуйте, {user.first_name}!\n\n"
+                "Вы попали в нашего Telegram-бота.\n"
+                "Здесь вы можете найти многое о сборках.\n\n"
+                "Выберите раздел:",
+                reply_markup=main_kb(user.id),
+            )
+            return
+        subscribed = await _verify_subscription(context.bot, user.id)
+        if subscribed:
+            await _mark_verified(user.id)
+            await q.edit_message_text(
+                f"✅ Спасибо за подписку, {user.first_name}!\n\n"
+                "Выберите раздел:",
+                reply_markup=main_kb(user.id),
+            )
+        else:
+            await q.answer("❌ Вы ещё не подписаны на канал.", show_alert=True)
         return
 
     if data == "admin_panel":
