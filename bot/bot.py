@@ -1381,12 +1381,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         target_id = int(data.split("_")[2])
         conn = get_db()
-        conn.execute("UPDATE tutorial_keys SET used_by = NULL, used_at = NULL WHERE used_by = ?", (target_id,))
+        # Удаляем ключ полностью — повторно ввести его нельзя
+        conn.execute("DELETE FROM tutorial_keys WHERE used_by = ?", (target_id,))
         conn.execute("DELETE FROM tutorial_access WHERE user_id = ?", (target_id,))
         conn.commit()
         conn.close()
         await q.edit_message_text(
-            f"✅ Подписка (туториалы) пользователя {target_id} обнулена.",
+            f"✅ Подписка (туториалы) пользователя {target_id} обнулена.\n"
+            "Ключ удалён — повторно ввести его невозможно.",
             reply_markup=back_admin_kb(),
         )
 
