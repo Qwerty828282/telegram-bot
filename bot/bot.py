@@ -3,6 +3,7 @@
 
 import os
 import re
+import html
 import sqlite3
 import logging
 import secrets
@@ -810,36 +811,35 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).fetchall()
         conn.close()
 
-        key_lines = ""
         if key_users:
-            lines = []
+            klines = []
             for r in key_users:
-                name = f"@{r['username']}" if r["username"] else (r["full_name"] or str(r["used_by"]))
-                key  = r["key_value"] or "—"
+                name = html.escape(f"@{r['username']}" if r["username"] else (r["full_name"] or str(r["used_by"])))
+                key  = html.escape(r["key_value"] or "—")
                 date = (r["used_at"] or "")[:10]
-                lines.append(f"  • {name} — `{key}` ({date})")
-            key_lines = "\n" + "\n".join(lines)
+                klines.append(f"  • {name} — <code>{key}</code> ({date})")
+            key_lines = "\n" + "\n".join(klines)
         else:
-            key_lines = "\n  _нет активных_"
+            key_lines = "\n  <i>нет активных</i>"
 
         db_type = "PostgreSQL ☁️" if USE_PG else "SQLite 💾"
         text = (
-            "📊 *Статистика бота*\n\n"
-            f"👥 Пользователей: *{total_users}*\n"
-            f"📦 Сборок: *{total_builds}*\n"
-            f"📚 Туториалов: *{total_tutorials}*\n"
-            f"🗄 База данных: *{db_type}*\n\n"
-            f"🔑 *Ключи:*\n"
-            f"  • Всего создано: *{total_keys}*\n"
-            f"  • Использовано: *{used_keys}*\n"
-            f"  • Свободных: *{free_keys}*\n\n"
-            f"*Последние активации:*{key_lines}"
+            "📊 <b>Статистика бота</b>\n\n"
+            f"👥 Пользователей: <b>{total_users}</b>\n"
+            f"📦 Сборок: <b>{total_builds}</b>\n"
+            f"📚 Туториалов: <b>{total_tutorials}</b>\n"
+            f"🗄 База данных: <b>{html.escape(db_type)}</b>\n\n"
+            f"🔑 <b>Ключи:</b>\n"
+            f"  • Всего создано: <b>{total_keys}</b>\n"
+            f"  • Использовано: <b>{used_keys}</b>\n"
+            f"  • Свободных: <b>{free_keys}</b>\n\n"
+            f"<b>Последние активации:</b>{key_lines}"
         )
         if len(text) > 4096:
             text = text[:4090] + "\n…"
         await q.edit_message_text(
             text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📋 Все ключи", callback_data="admin_keys_list")],
                 [InlineKeyboardButton("◀️ Назад в панель", callback_data="admin_panel")],
@@ -874,19 +874,20 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         free_count = 0
         used_count = 0
         for r in all_keys:
+            key_esc = html.escape(r["key_value"] or "")
             if r["used_by"]:
                 used_count += 1
-                name = f"@{r['username']}" if r["username"] else (r["full_name"] or str(r["used_by"]))
+                name = html.escape(f"@{r['username']}" if r["username"] else (r["full_name"] or str(r["used_by"])))
                 date = (r["used_at"] or "")[:10]
-                lines.append(f"🔴 `{r['key_value']}`\n   └ {name} ({date})")
+                lines.append(f"🔴 <code>{key_esc}</code>\n   └ {name} ({date})")
             else:
                 free_count += 1
                 created = (r["created_at"] or "")[:10]
-                lines.append(f"🟢 `{r['key_value']}`\n   └ свободен (создан {created})")
+                lines.append(f"🟢 <code>{key_esc}</code>\n   └ свободен (создан {created})")
 
         header = (
-            f"📋 *Все ключи* — всего {len(all_keys)}\n"
-            f"🟢 Свободных: *{free_count}*  |  🔴 Использованных: *{used_count}*\n\n"
+            f"📋 <b>Все ключи</b> — всего {len(all_keys)}\n"
+            f"🟢 Свободных: <b>{free_count}</b>  |  🔴 Использованных: <b>{used_count}</b>\n\n"
         )
         body = "\n".join(lines)
         text = header + body
@@ -894,7 +895,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = text[:4080] + "\n\n…и ещё больше"
         await q.edit_message_text(
             text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔑 Создать ключ", callback_data="admin_create_key")],
                 [InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")],
