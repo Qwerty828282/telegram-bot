@@ -517,12 +517,13 @@ def register_and_promote(user):
 
 
 def _extract_media(msg):
-    if msg.photo:
-        return msg.photo[-1].file_id, "photo"
-    if msg.video:
-        return msg.video.file_id, "video"
-    if msg.document:
-        return msg.document.file_id, "document"
+    if msg.photo:        return msg.photo[-1].file_id, "photo"
+    if msg.video:        return msg.video.file_id,     "video"
+    if msg.animation:    return msg.animation.file_id, "animation"
+    if msg.audio:        return msg.audio.file_id,     "audio"
+    if msg.voice:        return msg.voice.file_id,     "voice"
+    if msg.sticker:      return msg.sticker.file_id,   "sticker"
+    if msg.document:     return msg.document.file_id,  "document"
     return None, None
 
 
@@ -903,10 +904,12 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_add_build":
         if not is_admin(user.id):
             return
-        context.user_data["state"] = "admin_build_title"
+        context.user_data["state"] = "admin_build_msg"
         await q.edit_message_text(
-            "📦 *Публикация сборки — шаг 1/2*\n\n"
-            "Введите *название* сборки (будет отображаться в списке):",
+            "📦 *Публикация сборки*\n\n"
+            "Отправьте сообщение со сборкой — как будто пишете в обычный чат.\n\n"
+            "Можно отправить *текст*, *фото*, *видео*, *файл*, *аудио*, *GIF*, *стикер* — всё что угодно.\n"
+            "Первая строка текста/подписи станет названием в списке.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_panel")]]),
         )
@@ -1536,27 +1539,30 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not row:
             await q.edit_message_text("❌ Сборка не найдена.")
             return
-        caption = row["text"] or row["title"] or "Сборка"
-        if row["file_id"] and row["file_type"] == "photo":
-            await context.bot.send_photo(
-                chat_id=q.message.chat_id,
-                photo=row["file_id"],
-                caption=caption,
-            )
-        elif row["file_id"] and row["file_type"] == "video":
-            await context.bot.send_video(
-                chat_id=q.message.chat_id,
-                video=row["file_id"],
-                caption=caption,
-            )
-        elif row["file_id"] and row["file_type"] == "document":
-            await context.bot.send_document(
-                chat_id=q.message.chat_id,
-                document=row["file_id"],
-                caption=caption,
-            )
+        caption = row["text"] or row["title"] or ""
+        fid  = row["file_id"]
+        ftype = row["file_type"]
+        chat  = q.message.chat_id
+        if fid:
+            if ftype == "photo":
+                await context.bot.send_photo(chat_id=chat, photo=fid, caption=caption or None)
+            elif ftype == "video":
+                await context.bot.send_video(chat_id=chat, video=fid, caption=caption or None)
+            elif ftype == "animation":
+                await context.bot.send_animation(chat_id=chat, animation=fid, caption=caption or None)
+            elif ftype == "audio":
+                await context.bot.send_audio(chat_id=chat, audio=fid, caption=caption or None)
+            elif ftype == "voice":
+                await context.bot.send_voice(chat_id=chat, voice=fid, caption=caption or None)
+            elif ftype == "sticker":
+                if caption:
+                    await context.bot.send_message(chat_id=chat, text=caption)
+                await context.bot.send_sticker(chat_id=chat, sticker=fid)
+            else:  # document и всё остальное
+                await context.bot.send_document(chat_id=chat, document=fid, caption=caption or None)
         else:
-            await context.bot.send_message(chat_id=q.message.chat_id, text=caption)
+            if caption:
+                await context.bot.send_message(chat_id=chat, text=caption)
 
     elif data.startswith("view_tutorial_"):
         tut_id = int(data.split("_")[2])
@@ -1846,24 +1852,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Admin build flow ──
 
-    if state == "admin_build_title":
+    if state == "admin_build_msg":
         if not is_admin(user.id):
             return
-        context.user_data["build_title"] = text
-        context.user_data["state"]       = "admin_build_content"
-        await msg.reply_text(
-            "📦 *Публикация сборки — шаг 2/2*\n\n"
-            "Отправьте *текст* сборки (и/или прикрепите фото, видео, файл):",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="admin_panel")]]),
-        )
-        return
-
-    if state == "admin_build_content":
-        if not is_admin(user.id):
-            return
-        title     = context.user_data.get("build_title", "")
-        body      = msg.text or msg.caption or ""
+        body = msg.text or msg.caption or ""
+        # Первая строка — название; если пусто — дата
+        first_line = body.split("\n")[0].strip()
+        title = first_line[:60] if first_line else datetime.now().strftime("Сборка %d.%m.%Y %H:%M")
         file_id, file_type = _extract_media(msg)
         conn = get_db()
         conn.execute(
@@ -1874,7 +1869,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         context.user_data.clear()
         await msg.reply_text(
-            f"✅ *Сборка «{title}» опубликована!*",
+            f"✅ *Сборка опубликована!*\n\nНазвание в списке: _{title}_",
             parse_mode="Markdown",
             reply_markup=main_kb(user.id),
         )
