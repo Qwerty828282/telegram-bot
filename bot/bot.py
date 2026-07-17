@@ -835,17 +835,19 @@ async def _save_tutorial(q_or_msg, context):
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query
-    await q.answer()
     data = q.data
     user = q.from_user
     register_and_promote(user)
 
+    # ── Бан — отвечаем и выходим до q.answer() ──
     if user.id in _banned_ids and user.id != OWNER_ID:
         await q.answer("🚫 Вы заблокированы.", show_alert=True)
         return
 
+    # ── Проверка подписки — нужен собственный q.answer() ──
     if data == "check_sub":
         if user.id in _channel_verified:
+            await q.answer()
             await q.edit_message_text(
                 f"👋 Здравствуйте, {user.first_name}!\n\n"
                 "Вы попали в нашего Telegram-бота.\n"
@@ -857,6 +859,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subscribed = await _verify_subscription(context.bot, user.id)
         if subscribed:
             await _mark_verified(user.id)
+            await q.answer("✅ Подписка подтверждена!")
             await q.edit_message_text(
                 f"✅ Спасибо за подписку, {user.first_name}!\n\n"
                 "Выберите раздел:",
@@ -865,6 +868,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await q.answer("❌ Вы ещё не подписаны на канал.", show_alert=True)
         return
+
+    # ── Универсальный ответ для всех остальных кнопок ──
+    await q.answer()
 
     if data == "admin_panel":
         if not is_admin(user.id):
